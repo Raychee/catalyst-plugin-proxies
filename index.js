@@ -1,6 +1,6 @@
 const {get, isEmpty} = require('lodash');
-
-const {sleep, dedup, limit, requestWithTimeout} = require('@raychee/utils');
+const request = require('request-promise-native');
+const {sleep, dedup, limit, timeout} = require('@raychee/utils');
 
 
 class Dummy {
@@ -80,7 +80,14 @@ module.exports = {
                     );
                 }
                 if (requestTimeout !== this.options.requestTimeout) {
-                    this.request = requestWithTimeout(this.options.requestTimeout * 1000);
+                    this.request = timeout(request, this.options.requestTimeout * 1000, {
+                        error() {
+                            const e = new Error('ETIMEDOUT');
+                            e.code = 'ETIMEDOUT';
+                            e.connect = true;
+                            return e;
+                        }
+                    });
                 }
                 if (type) this.type = type;
                 if (!proxyTypes[this.type]) {

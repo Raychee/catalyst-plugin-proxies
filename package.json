@@ -1,10 +1,9 @@
 {
   "name": "@raychee/catalyst-plugin-proxies",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "proxies plugin for catalyst",
   "main": "index.js",
-  "scripts": {
-  },
+  "scripts": {},
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Raychee/catalyst-plugin-proxies.git"
@@ -16,7 +15,9 @@
   },
   "homepage": "https://github.com/Raychee/catalyst-plugin-proxies#readme",
   "dependencies": {
-    "@raychee/utils": "^0.1.19",
-    "lodash": "^4.17.15"
+    "@raychee/utils": "^0.2.3",
+    "lodash": "^4.17.15",
+    "request": "^2.88.2",
+    "request-promise-native": "^1.0.8"
   }
 }
