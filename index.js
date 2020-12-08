@@ -39,16 +39,15 @@ module.exports = {
             constructor(logger, name, pluginLoader, {stored = false} = {}) {
                 this.logger = logger;
                 this.name = name;
-                this._proxies = {};
 
+                this._proxies = {};
                 this._stored = stored;
                 this._pluginLoader = pluginLoader;
                 this._request = undefined;
                 this._nextTimeRequestProxyList = 0;
 
-                this._load = dedup(Proxies.prototype._load.bind(this));
+                this._load = limit(Proxies.prototype._load.bind(this), 1);
                 this._requestProxyList = dedup(Proxies.prototype._requestProxyList.bind(this), {key: null});
-                this._get = limit(Proxies.prototype._get.bind(this), 1);
                 this._syncStoreForce = dedup(Proxies.prototype._syncStoreForce.bind(this), {queue: 1});
             }
 
@@ -67,24 +66,24 @@ module.exports = {
             }
 
             async _load({type, options, proxies = {}} = {}) {
-                const {minIntervalBetweenStoreUpdate} = this.options || {};
+                const {minIntervalBetweenStoreUpdate} = this._options || {};
                 // const {
                 //     url, 
                 //     maxDeprecationsBeforeRemoval = 1, minIntervalBetweenUse = 0, recentlyUsedFirst = true,
                 //     minIntervalBetweenRequest = 5, minIntervalBetweenStoreUpdate = 10,
                 //     proxiesWithIdentityTTL = 24 * 60 * 60, maxRetryRequest = -1, 
                 // } = options;
-                this.options = this._makeOptions(options);
-                if (minIntervalBetweenStoreUpdate !== this.options.minIntervalBetweenStoreUpdate) {
+                this._options = this._makeOptions(options);
+                if (minIntervalBetweenStoreUpdate !== this._options.minIntervalBetweenStoreUpdate) {
                     this._syncStoreForce = dedup(
                         Proxies.prototype._syncStoreForce.bind(this),
-                        {within: this.options.minIntervalBetweenStoreUpdate * 1000, queue: 1}
+                        {within: this._options.minIntervalBetweenStoreUpdate * 1000, queue: 1}
                     );
                 }
                 this._request = await this._pluginLoader.get({type: 'request', ...options._request});
                 if (type) this.type = type;
                 if (!proxyTypes[this.type]) {
-                    this.logger.crash('proxies_bad_config', 'unknown proxies type: ', this.type);
+                    this.logger.crash('proxies_bad_config', this._logPrefix(), 'unknown proxies type: ', this.type);
                 }
                 for (const proxy of this._iterProxies(proxies)) {
                     const id = this._id(proxy);
@@ -97,13 +96,13 @@ module.exports = {
                 let trial = 0, ignoreRequestInterval = false;
                 while (true) {
                     trial++;
-                    if (!this.options.url) {
-                        if (this.options.allowNoProxy) {
+                    if (!this._options.url) {
+                        if (this._options.allowNoProxy) {
                             this._warn(logger, 'proxies url is not specified, so no proxy can be loaded.');
                             return false;
                         } else {
                             if (this._stored) {
-                                while (!this.options.url) {
+                                while (!this._options.url) {
                                     const store = await this.logger.pull({
                                         waitUntil: s => get(s, [this.name, 'options', 'url']),
                                         message: `${this.name}.options.url need to be valid`
@@ -113,39 +112,39 @@ module.exports = {
                                 trial = 0;
                                 continue;
                             } else {
-                                this.logger.crash('proxies_bad_config', 'proxies url must be specified');
+                                this.logger.crash('proxies_bad_config', this._logPrefix(), 'proxies url must be specified');
                             }
                         }
                     }
                     if (!ignoreRequestInterval) {
                         const waitInterval = this._nextTimeRequestProxyList - Date.now();
                         if (waitInterval > 0) {
-                            this._info(logger, 'Wait ', waitInterval / 1000, ' seconds before refreshing proxy list through ', this.options.url);
+                            this._info(logger, 'Wait ', waitInterval / 1000, ' seconds before refreshing proxy list through ', this._options.url);
                             await sleep(waitInterval);
                         }
                     }
-                    this._info(logger, 'Refresh proxy list: ', this.options.url);
+                    this._info(logger, 'Refresh proxy list: ', this._options.url);
                     let resp, error, proxiesRequested = [];
-                    const reqOptions = {uri: this.options.url, ...proxyTypes[this.type].requestOptions};
+                    const reqOptions = {uri: this._options.url, ...proxyTypes[this.type].requestOptions};
                     try {
                         resp = await this._request.instance(logger, reqOptions);
                     } catch (e) {
                         error = e;
                     }
-                    this._nextTimeRequestProxyList = Date.now() + this.options.minIntervalBetweenRequest * 1000;
+                    this._nextTimeRequestProxyList = Date.now() + this._options.minIntervalBetweenRequest * 1000;
                     ignoreRequestInterval = false;
                     try {
                         proxiesRequested = await proxyTypes[this.type].requestParser({resp, error});
                     } catch (e) {
                         this._warn(
-                            logger, 'Failed parsing proxy response from ', this.options.url, 
+                            logger, 'Failed parsing proxy response from ', this._options.url, 
                             ' -> ', e, ' : ', {resp, error}
                         );
                         proxiesRequested = 'INVALID_URL';
                     }
                     if (proxiesRequested === 'INVALID_URL') {
-                        if (this.options.allowNoProxy) {
-                            this._warn(logger, this.name, ' url is invalid for refreshing proxy list: ', this.options.url);
+                        if (this._options.allowNoProxy) {
+                            this._warn(logger, this.name, ' url is invalid for refreshing proxy list: ', this._options.url);
                             return false;
                         } else {
                             if (this._stored) {
@@ -154,14 +153,17 @@ module.exports = {
                                 const store = await this.logger.pull({
                                     waitUntil: s => {
                                         const url = get(s, [this.name, 'options', 'url']);
-                                        return url && url !== this.options.url;
+                                        return url && url !== this._options.url;
                                     },
                                     message
                                 });
                                 await this._load(store);
                                 trial = 0;
                             } else {
-                                logger.crash('proxies_invalid_url', 'Invalid url for refreshing proxy list ', this.options.url, ' -> ', resp || error);
+                                this._crash(
+                                    logger, 'proxies_invalid_url', 'Invalid url for refreshing proxy list ', 
+                                    this._options.url, ' -> ', resp || error
+                                );
                             }
                         }
                     } else if (proxiesRequested === 'REQUEST_TOO_FREQUENT') {
@@ -189,37 +191,37 @@ module.exports = {
                             return true;
                         }
                         const errorMessage = proxiesRequested === 'UNKNOWN_ERROR' ? 'There is an unknown error' : 'No new proxies are added';
-                        if (!(this.options.maxRetryRequest >= 0)) {
-                            if (this.options.allowNoProxy) {
+                        if (!(this._options.maxRetryRequest >= 0)) {
+                            if (this._options.allowNoProxy) {
                                 this._warn(
-                                    logger, errorMessage, ' during refreshing proxy list from ', this.options.url,
+                                    logger, errorMessage, ' during refreshing proxy list from ', this._options.url,
                                     ': ', resp || error
                                 );
                                 return false;
                             } else {
-                                logger.fail(
-                                    'proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this.options.url,
+                                this._fail(
+                                    logger, 'proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this._options.url,
                                     ': ', resp || error
                                 );
                             }
-                        } else if (trial <= this.options.maxRetryRequest) {
+                        } else if (trial <= this._options.maxRetryRequest) {
                             this._warn(
-                                logger, errorMessage, ' during refreshing proxy list from ', this.options.url,
-                                ', will re-try (', trial, '/', this.options.maxRetryRequest, '): ', resp || error
+                                logger, errorMessage, ' during refreshing proxy list from ', this._options.url,
+                                ', will re-try (', trial, '/', this._options.maxRetryRequest, '): ', resp || error
                             );
                         } else {
-                            if (this.options.allowNoProxy) {
+                            if (this._options.allowNoProxy) {
                                 this._warn(
-                                    logger, errorMessage, ' during refreshing proxy list from ', this.options.url,
+                                    logger, errorMessage, ' during refreshing proxy list from ', this._options.url,
                                     ', and too many retries have been performed (',
-                                    this.options.maxRetryRequest, '/', this.options.maxRetryRequest, '): ', resp || error
+                                    this._options.maxRetryRequest, '/', this._options.maxRetryRequest, '): ', resp || error
                                 );
                                 return false;
                             } else {
-                                logger.fail(
-                                    'proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this.options.url,
+                                this._fail(
+                                    logger, 'proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this._options.url,
                                     ', and too many retries have been performed (',
-                                    this.options.maxRetryRequest, '/', this.options.maxRetryRequest, '): ', resp || error
+                                    this._options.maxRetryRequest, '/', this._options.maxRetryRequest, '): ', resp || error
                                 );
                             }
                         }
@@ -255,11 +257,11 @@ module.exports = {
                         const {identityBlacklist} = p;
                         if (p.identity) continue;
                         if (identity && identityBlacklist && identityBlacklist.includes(identity)) continue;
-                        if (p.lastTimeUsed > Date.now() - this.options.minIntervalBetweenUse * 1000) continue;
+                        if (p.lastTimeUsed > Date.now() - this._options.minIntervalBetweenUse * 1000) continue;
                         if (!proxy) {
                             proxy = p;
                         } else {
-                            if (this.options.recentlyUsedFirst) {
+                            if (this._options.recentlyUsedFirst) {
                                 if (p.lastTimeUsed > proxy.lastTimeUsed) {
                                     proxy = p;
                                 }
@@ -296,9 +298,9 @@ module.exports = {
                 proxy.deprecated = (proxy.deprecated || 0) + 1;
                 this._info(
                     logger, this._str(proxy), ' is marked as deprecated (',
-                    proxy.deprecated, '/', this.options.maxDeprecationsBeforeRemoval, ').'
+                    proxy.deprecated, '/', this._options.maxDeprecationsBeforeRemoval, ').'
                 );
-                if (proxy.deprecated >= this.options.maxDeprecationsBeforeRemoval) {
+                if (proxy.deprecated >= this._options.maxDeprecationsBeforeRemoval) {
                     this.remove(logger, proxy);
                 } else {
                     if (clearIdentity && proxy.identity) {
@@ -407,12 +409,12 @@ module.exports = {
 
             _isDeprecated(proxy) {
                 const {deprecated} = proxy;
-                return deprecated >= this.options.maxDeprecationsBeforeRemoval;
+                return deprecated >= this._options.maxDeprecationsBeforeRemoval;
             }
 
             _isIdentityExpired(proxy) {
                 const {identity, identityAssignedAt} = proxy;
-                return identity && identityAssignedAt < Date.now() - this.options.proxiesWithIdentityTTL * 1000;
+                return identity && identityAssignedAt < Date.now() - this._options.proxiesWithIdentityTTL * 1000;
             }
 
             _makeOptions(options) {
@@ -423,13 +425,25 @@ module.exports = {
                     ...options
                 };
             }
+            
+            _logPrefix() {
+                return this.name ? `Proxies ${this.name}: ` : 'Proxies: ';
+            }
 
             _info(logger, ...args) {
-                (logger || this.logger).info(this.name ? `Proxies ${this.name}: ` : 'Proxies: ', ...args);
+                (logger || this.logger).info(this._logPrefix(), ...args);
             }
 
             _warn(logger, ...args) {
-                (logger || this.logger).warn(this.name ? `Proxies ${this.name}: ` : 'Proxies: ', ...args);
+                (logger || this.logger).warn(this._logPrefix(), ...args);
+            }
+            
+            _fail(logger, code, ...args) {
+                (logger || this.logger).fail(code, this._logPrefix(), ...args);
+            }
+
+            _crash(logger, code, ...args) {
+                (logger || this.logger).crash(code, this._logPrefix(), ...args);
             }
             
             async _unload(job) {
