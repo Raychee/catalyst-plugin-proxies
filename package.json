@@ -16,6 +16,6 @@
   "homepage": "https://github.com/Raychee/catalyst-plugin-proxies#readme",
   "dependencies": {
     "@raychee/utils": "^0.2.28",
-    "lodash": "^4.17.15"
+    "lodash": "^4.17.20"
   }
 }
