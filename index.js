@@ -41,6 +41,7 @@ module.exports = {
                 this.name = name;
 
                 this._proxies = {};
+                this._type = undefined;
                 this._stored = stored;
                 this._pluginLoader = pluginLoader;
                 this._request = undefined;
@@ -71,7 +72,7 @@ module.exports = {
                 //     url, 
                 //     maxDeprecationsBeforeRemoval = 1, minIntervalBetweenUse = 0, recentlyUsedFirst = true,
                 //     minIntervalBetweenRequest = 5, minIntervalBetweenStoreUpdate = 10,
-                //     proxiesWithIdentityTTL = 24 * 60 * 60, maxRetryRequest = -1, 
+                //     proxiesWithIdentityTTL = 24 * 60 * 60, maxRetryRequest = -1, allowNoProxy = true,
                 // } = options;
                 this._options = this._makeOptions(options);
                 if (minIntervalBetweenStoreUpdate !== this._options.minIntervalBetweenStoreUpdate) {
@@ -80,10 +81,13 @@ module.exports = {
                         {within: this._options.minIntervalBetweenStoreUpdate * 1000, queue: 1}
                     );
                 }
-                this._request = await this._pluginLoader.get({type: 'request', ...options._request});
-                if (type) this.type = type;
-                if (!proxyTypes[this.type]) {
-                    this.logger.crash('proxies_bad_config', this._logPrefix(), 'unknown proxies type: ', this.type);
+                if (this._request) {
+                    await this._request.destroy();
+                }
+                this._request = await this._pluginLoader.get({type: 'request', ...options.request});
+                if (type) this._type = type;
+                if (!proxyTypes[this._type]) {
+                    this.logger.crash('proxies_bad_config', this._logPrefix(), 'unknown proxies type: ', this._type);
                 }
                 for (const proxy of this._iterProxies(proxies)) {
                     const id = this._id(proxy);
@@ -125,7 +129,7 @@ module.exports = {
                     }
                     this._info(logger, 'Refresh proxy list: ', this._options.url);
                     let resp, error, proxiesRequested = [];
-                    const reqOptions = {uri: this._options.url, ...proxyTypes[this.type].requestOptions};
+                    const reqOptions = {uri: this._options.url, ...proxyTypes[this._type].requestOptions};
                     try {
                         resp = await this._request.instance(logger, reqOptions);
                     } catch (e) {
@@ -134,7 +138,7 @@ module.exports = {
                     this._nextTimeRequestProxyList = Date.now() + this._options.minIntervalBetweenRequest * 1000;
                     ignoreRequestInterval = false;
                     try {
-                        proxiesRequested = await proxyTypes[this.type].requestParser({resp, error});
+                        proxiesRequested = await proxyTypes[this._type].requestParser({resp, error});
                     } catch (e) {
                         this._warn(
                             logger, 'Failed parsing proxy response from ', this._options.url, 
