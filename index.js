@@ -1,5 +1,5 @@
-const {get, isEmpty} = require('lodash');
-const {sleep, dedup, limit} = require('@raychee/utils');
+const {get, setWith, isEmpty} = require('lodash');
+const {dedup, limit} = require('@raychee/utils');
 
 
 class Dummy {
@@ -40,10 +40,11 @@ module.exports = {
                 this.logger = logger;
                 this.name = name;
 
-                this._proxies = {};
-                this._type = undefined;
-                this._stored = stored;
                 this._pluginLoader = pluginLoader;
+                this._stored = stored;
+                this._proxies = {};
+                this._identities = {};
+                this._type = undefined;
                 this._request = undefined;
                 this._nextTimeRequestProxyList = 0;
 
@@ -57,7 +58,7 @@ module.exports = {
                     store = get(await this.logger.pull(), this.name);
                     if (!store) {
                         this.logger.crash(
-                            'proxies_invalid_name', 'invalid proxies name: ', this.name, ', please make sure: ',
+                            'plugin_proxies_invalid_name', 'invalid proxies name: ', this.name, ', please make sure: ',
                             '1. there is a document in the internal collection service.Store that matches filter {plugin: \'proxies\'}, ',
                             '2. there is a valid entry under document field \'data.', this.name, '\''
                         );
@@ -66,14 +67,9 @@ module.exports = {
                 await this._load(store);
             }
 
-            async _load({type, options, proxies = {}} = {}) {
+            async _load(store = {}) {
+                const {type, options, proxies = {}, identities = {}} = store;
                 const {minIntervalBetweenStoreUpdate} = this._options || {};
-                // const {
-                //     url, 
-                //     maxDeprecationsBeforeRemoval = 1, minIntervalBetweenUse = 0, recentlyUsedFirst = true,
-                //     minIntervalBetweenRequest = 5, minIntervalBetweenStoreUpdate = 10,
-                //     proxiesWithIdentityTTL = 24 * 60 * 60, maxRetryRequest = -1, allowNoProxy = true,
-                // } = options;
                 this._options = this._makeOptions(options);
                 if (minIntervalBetweenStoreUpdate !== this._options.minIntervalBetweenStoreUpdate) {
                     this._syncStoreForce = dedup(
@@ -81,17 +77,99 @@ module.exports = {
                         {within: this._options.minIntervalBetweenStoreUpdate * 1000, queue: 1}
                     );
                 }
+                if (type) this._type = type;
+                if (!proxyTypes[this._type]) {
+                    this.logger.crash('plugin_proxies_bad_config', this._logPrefix(), 'unknown proxies type: ', this._type);
+                }
                 if (this._request) {
                     await this._request.destroy();
                 }
-                this._request = await this._pluginLoader.get({type: 'request', ...options.request});
-                if (type) this._type = type;
-                if (!proxyTypes[this._type]) {
-                    this.logger.crash('proxies_bad_config', this._logPrefix(), 'unknown proxies type: ', this._type);
-                }
+                this._request = await this._pluginLoader.get({type: 'request', ...this._options.request});
                 for (const proxy of this._iterProxies(proxies)) {
                     const id = this._id(proxy);
                     this._proxies[id] = {...proxy, ...this._proxies[id]};
+                }
+                for (const [id, identity] of Object.entries(identities)) {
+                    this._identities[id] = {...identity, ...this._identities[id]};
+                }
+            }
+            
+            _makeOptions(options) {
+                return {
+                    maxDeprecationsBeforeRemoval: 1, minIntervalBetweenUse: 0, recentlyUsedFirst: true,
+                    minIntervalBetweenRequest: 5, minIntervalBetweenStoreUpdate: 10,
+                    proxiesWithIdentityTTL: 24 * 60 * 60, maxRetryRequest: -1, allowNoProxy: true,
+                    identityWithoutProxyTTL: 24 * 60 * 60, 
+                    identityLocationPreferred: true, identityLocationConstrained: true,
+                    ...options
+                };
+            }
+
+            async get(logger, identity) {
+                logger = logger || this.logger;
+                this._purge(logger);
+                let proxy = undefined, location = undefined;
+                if (identity) {
+                    const p = get(this._identities, [identity, 'proxy']);
+                    location = get(this._identities, [identity, 'location']);
+                    proxy = this._proxies[p];
+                    if (!proxy) {
+                        for (const p of this._iterProxies()) {
+                            if (p.identity === identity) {
+                                proxy = p;
+                            }
+                        }
+                    }
+                }
+                if (!proxy) {
+                    let load = true;
+                    while (!proxy && load) {
+                        for (const p of this._iterProxies()) {
+                            const {identityBlacklist} = p;
+                            if (p.identity) continue;
+                            if (identity && identityBlacklist && identityBlacklist.includes(identity)) continue;
+                            if (p.lastTimeUsed > Date.now() - this._options.minIntervalBetweenUse * 1000) continue;
+                            if (get(this._identities, [identity, 'proxyBlacklist'], []).includes(this._id(p))) continue;
+                            if (location) {
+                                if (p.location !== location) {
+                                    if (this._options.identityLocationConstrained) continue;
+                                    if (this._options.identityLocationPreferred && proxy && proxy.location === location) continue;
+                                } else if (proxy && proxy.location !== location) {
+                                    proxy = undefined;
+                                }
+                            }
+                            if (!proxy) {
+                                proxy = p;
+                            } else {
+                                if (this._options.recentlyUsedFirst) {
+                                    if (p.lastTimeUsed > proxy.lastTimeUsed) {
+                                        proxy = p;
+                                    }
+                                } else {
+                                    if (p.lastTimeUsed < proxy.lastTimeUsed) {
+                                        proxy = p;
+                                    }
+                                }
+                            }
+                        }
+                        if (!proxy) load = await this._requestProxyList(logger);
+                    }
+                }
+                if (proxy) {
+                    if (identity) {
+                        proxy.identity = identity;
+                        proxy.identityAssignedAt = new Date();
+                        setWith(this._identities, [identity, 'proxy'], this._id(proxy), Object);
+                        setWith(this._identities, [identity, 'lastTimeAssignedProxy'], new Date(), Object);
+                        setWith(this._identities, [identity, 'location'], proxy.location || null, Object);
+                    }
+                    this.touch(logger, proxy);
+                    const one = this._str(proxy);
+                    this._info(
+                        logger, one, ...(proxy.location ? [' (', proxy.location, ')'] : []),
+                        ' is being used', identity ? ` for identity ${identity}` : '', '.'
+                    );
+                    return one;
                 }
             }
 
@@ -116,15 +194,15 @@ module.exports = {
                                 trial = 0;
                                 continue;
                             } else {
-                                this.logger.crash('proxies_bad_config', this._logPrefix(), 'proxies url must be specified');
+                                this.logger.crash('plugin_proxies_bad_config', this._logPrefix(), 'proxies url must be specified');
                             }
                         }
                     }
                     if (!ignoreRequestInterval) {
-                        const waitInterval = this._nextTimeRequestProxyList - Date.now();
+                        const waitInterval = (this._nextTimeRequestProxyList - Date.now()) / 1000;
                         if (waitInterval > 0) {
-                            this._info(logger, 'Wait ', waitInterval / 1000, ' seconds before refreshing proxy list through ', this._options.url);
-                            await sleep(waitInterval);
+                            this._info(logger, 'Wait ', waitInterval, ' seconds before refreshing proxy list through ', this._options.url);
+                            await logger.sleep(waitInterval);
                         }
                     }
                     this._info(logger, 'Refresh proxy list: ', this._options.url);
@@ -141,7 +219,7 @@ module.exports = {
                         proxiesRequested = await proxyTypes[this._type].requestParser({resp, error});
                     } catch (e) {
                         this._warn(
-                            logger, 'Failed parsing proxy response from ', this._options.url, 
+                            logger, 'Failed parsing proxy response from ', this._options.url,
                             ' -> ', e, ' : ', {resp, error}
                         );
                         proxiesRequested = 'INVALID_URL';
@@ -165,7 +243,7 @@ module.exports = {
                                 trial = 0;
                             } else {
                                 this._crash(
-                                    logger, 'proxies_invalid_url', 'Invalid url for refreshing proxy list ', 
+                                    logger, 'plugin_proxies_invalid_url', 'Invalid url for refreshing proxy list ',
                                     this._options.url, ' -> ', resp || error
                                 );
                             }
@@ -192,6 +270,7 @@ module.exports = {
                             }
                         }
                         if (added > 0) {
+                            this._info(logger, added, ' proxies are added from ', this._options.url);
                             return true;
                         }
                         const errorMessage = proxiesRequested === 'UNKNOWN_ERROR' ? 'There is an unknown error' : 'No new proxies are added';
@@ -204,7 +283,7 @@ module.exports = {
                                 return false;
                             } else {
                                 this._fail(
-                                    logger, 'proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this._options.url,
+                                    logger, 'plugin_proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this._options.url,
                                     ': ', resp || error
                                 );
                             }
@@ -223,7 +302,7 @@ module.exports = {
                                 return false;
                             } else {
                                 this._fail(
-                                    logger, 'proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this._options.url,
+                                    logger, 'plugin_proxies_refresh_error', errorMessage, ' during refreshing proxy list from ', this._options.url,
                                     ', and too many retries have been performed (',
                                     this._options.maxRetryRequest, '/', this._options.maxRetryRequest, '): ', resp || error
                                 );
@@ -231,62 +310,6 @@ module.exports = {
                         }
                     }
                 }
-            }
-
-            async get(logger, identity) {
-                logger = logger || this.logger;
-                this._purge(logger);
-                let proxy = undefined, one = undefined;
-                if (identity) {
-                    for (const p of this._iterProxies()) {
-                        if (p.identity === identity) {
-                            proxy = p;
-                        }
-                    }
-                }
-                if (!proxy) {
-                    proxy = await this._get(logger, identity);
-                }
-                if (proxy) {
-                    one = this._str(proxy);
-                    this._info(logger, one, ' is being used', identity ? ` for identity ${identity}` : '', '.');
-                }
-                return one;
-            }
-
-            async _get(logger, identity) {
-                let load = true, proxy = undefined;
-                while (!proxy && load) {
-                    for (const p of this._iterProxies()) {
-                        const {identityBlacklist} = p;
-                        if (p.identity) continue;
-                        if (identity && identityBlacklist && identityBlacklist.includes(identity)) continue;
-                        if (p.lastTimeUsed > Date.now() - this._options.minIntervalBetweenUse * 1000) continue;
-                        if (!proxy) {
-                            proxy = p;
-                        } else {
-                            if (this._options.recentlyUsedFirst) {
-                                if (p.lastTimeUsed > proxy.lastTimeUsed) {
-                                    proxy = p;
-                                }
-                            } else {
-                                if (p.lastTimeUsed < proxy.lastTimeUsed) {
-                                    proxy = p;
-                                }
-                            }
-                        }
-                    }
-                    if (!proxy) load = await this._requestProxyList(logger);
-                }
-                if (proxy) {
-                    if (identity) {
-                        proxy.identity = identity;
-                        proxy.identityAssignedAt = new Date();
-                    }
-                    this.touch(logger, proxy);
-                    this._syncStore();
-                }
-                return proxy;
             }
 
             touch(_, one) {
@@ -307,18 +330,21 @@ module.exports = {
                 if (proxy.deprecated >= this._options.maxDeprecationsBeforeRemoval) {
                     this.remove(logger, proxy);
                 } else {
-                    if (clearIdentity && proxy.identity) {
+                    if (clearIdentity) {
                         this._deprecateIdentity(proxy);
                     }
                 }
                 this._syncStore();
             }
 
-            remove(logger, one) {
+            remove(logger, one, {clearIdentity = true} = {}) {
                 const proxy = this._find(one);
                 if (!proxy) return;
                 this._proxies[this._id(proxy)] = null;
                 this._info(logger, this._str(proxy), ' is removed: ', proxy);
+                if (clearIdentity) {
+                    this._deprecateIdentity(proxy, {proxyRemoved: true});
+                }
                 this._syncStore();
             }
 
@@ -344,6 +370,13 @@ module.exports = {
                 }
             }
 
+            * _iterIdentities(identities) {
+                for (const identity of Object.values(identities || this._identities)) {
+                    if (!identity) continue;
+                    yield identity;
+                }
+            }
+
             _purge(logger) {
                 Object.entries(this._proxies)
                     .filter(([, p]) => !this._isValid(p))
@@ -353,39 +386,81 @@ module.exports = {
                         this._clearIdentity(proxy);
                     }
                 }
+                Object.entries(this._identities)
+                    .filter(([, i]) => i && this._isIdentityWithoutProxyExpired(i))
+                    .forEach(([id, i]) => {
+                        this._info(logger, 'purge: ', id, ' - ', i);
+                        this._identities[id] = null;
+                    });
+                for (const identity of this._iterIdentities()) {
+                    if (identity.proxy && !this._proxies[identity.proxy]) {
+                        this._clearIdentityProxy(identity);
+                    }
+                    if (identity.proxyBlacklist) {
+                        identity.proxyBlacklist = identity.proxyBlacklist.filter(p => this._proxies[p]); 
+                    }
+                    if (this._isIdentityProxyExpired(identity)) {
+                        this._clearIdentityProxy(identity);
+                    }
+                }
             }
 
-            _deprecateIdentity(proxy) {
-                if (!proxy.identityBlacklist) proxy.identityBlacklist = [];
-                proxy.identityBlacklist.push(proxy.identity);
+            _deprecateIdentity(proxy, {proxyRemoved} = {}) {
+                if (proxy.identity) {
+                    if (!proxy.identityBlacklist) proxy.identityBlacklist = [];
+                    proxy.identityBlacklist.push(proxy.identity);
+                }
                 this._clearIdentity(proxy);
+                const p = this._id(proxy);
+                for (const identity of this._iterIdentities()) {
+                    if (identity.proxy !== p) continue;
+                    if (proxyRemoved) {
+                        if (identity.proxyBlacklist) {
+                            identity.proxyBlacklist = identity.proxyBlacklist.filter(pb => pb !== p);
+                        }
+                    } else {
+                        if (!identity.proxyBlacklist) identity.proxyBlacklist = [];
+                        identity.proxyBlacklist.push(p);
+                    }
+                    this._clearIdentityProxy(identity);
+                }
             }
             
             _clearIdentity(proxy) {
-                proxy.identity = undefined;
-                proxy.identityAssignedAt = undefined;
+                proxy.identity = null;
+                proxy.identityAssignedAt = null;
+            }
+            
+            _clearIdentityProxy(identity) {
+                identity.proxy = null;
+                identity.lastTimeAssignedProxy = new Date();
             }
 
             async _syncStoreForce() {
-                let deleteNullProxies = true;
+                let deleteNulls = true;
                 if (this._stored) {
                     try {
                         let store;
                         if (isEmpty(this._proxies)) {
                             store = await this.logger.pull();
                         } else {
-                            store = await this.logger.push({[this.name]: {proxies: this._proxies}});
+                            store = await this.logger.push({
+                                [this.name]: {proxies: this._proxies, identities: this._identities}
+                            });
                         }
                         await this._load(store[this.name]);
                     } catch (e) {
-                        deleteNullProxies = false;
+                        deleteNulls = false;
                         this._warn(undefined, 'Sync proxies of name ', this.name, ' failed: ', e);
                     }
                 }
-                if (deleteNullProxies) {
+                if (deleteNulls) {
                     Object.entries(this._proxies)
                         .filter(([, p]) => !p)
                         .forEach(([id]) => delete this._proxies[id]);
+                    Object.entries(this._identities)
+                        .filter(([, i]) => !i)
+                        .forEach(([id]) => delete this._identities[id]);
                 }
             }
 
@@ -420,14 +495,15 @@ module.exports = {
                 const {identity, identityAssignedAt} = proxy;
                 return identity && identityAssignedAt < Date.now() - this._options.proxiesWithIdentityTTL * 1000;
             }
-
-            _makeOptions(options) {
-                return {
-                    maxDeprecationsBeforeRemoval: 1, minIntervalBetweenUse: 0, recentlyUsedFirst: true,
-                    minIntervalBetweenRequest: 5, minIntervalBetweenStoreUpdate: 10,
-                    proxiesWithIdentityTTL: 24 * 60 * 60, maxRetryRequest: -1, allowNoProxy: true,
-                    ...options
-                };
+            
+            _isIdentityProxyExpired(identity) {
+                const {proxy, lastTimeAssignedProxy} = identity;
+                return proxy && lastTimeAssignedProxy < Date.now() - this._options.proxiesWithIdentityTTL * 1000;
+            }
+            
+            _isIdentityWithoutProxyExpired(identity) {
+                const {proxy, lastTimeAssignedProxy} = identity;
+                return !proxy && lastTimeAssignedProxy < Date.now() - this._options.identityWithoutProxyTTL * 1000; 
             }
             
             _logPrefix() {
