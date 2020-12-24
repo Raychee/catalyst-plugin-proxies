@@ -100,48 +100,80 @@ module.exports = {
                     minIntervalBetweenRequest: 5, minIntervalBetweenStoreUpdate: 10,
                     proxiesWithIdentityTTL: 24 * 60 * 60, maxRetryRequest: -1, allowNoProxy: true,
                     identityWithoutProxyTTL: 24 * 60 * 60, 
-                    identityLocationPreferred: true, identityLocationConstrained: true,
+                    identityLocationPreferred: true, identityLocationConstrained: false,
+                    identityHistoricalLocationPreferred: true,
+                    // request: {},
                     ...options
                 };
             }
 
-            async get(logger, identity) {
+            async get(logger, {id, location} = {}, options = {}) {
                 logger = logger || this.logger;
+                options = {...this._options, ...options};
+                let historicalLocation = undefined;
                 this._purge(logger);
-                let proxy = undefined, location = undefined;
-                if (identity) {
-                    const p = get(this._identities, [identity, 'proxy']);
-                    location = get(this._identities, [identity, 'location']);
+                let proxy = undefined;
+                if (id) {
+                    const p = get(this._identities, [id, 'proxy']);
+                    historicalLocation = get(this._identities, [id, 'location']);
                     proxy = this._proxies[p];
                     if (!proxy) {
                         for (const p of this._iterProxies()) {
-                            if (p.identity === identity) {
+                            if (p.identity === id) {
                                 proxy = p;
                             }
                         }
                     }
                 }
+                const locationPreference = Object.fromEntries((
+                    options.identityHistoricalLocationPreferred ? 
+                        [historicalLocation, location] : [location, historicalLocation])
+                    .filter(l => l).map((l, precedence) => [l, precedence]).reverse()
+                );
                 if (!proxy) {
+                    const prioritizedLocations = Object.entries(locationPreference)
+                        .sort((a, b) => a[1] - b[1])
+                        .map(([l]) => l);
+                    this._info(
+                        logger, 'Get a proxy', ...(id ? [' for identity ', id] : []),
+                        ...(!isEmpty(locationPreference) ? [
+                            ' with location ', 
+                            ...(options.identityLocationConstrained ? 
+                                ['constraint: ', prioritizedLocations[0]] : 
+                                ['preference: ', prioritizedLocations.join(', ')]
+                            )
+                        ] : []), '.'
+                    );
                     let load = true;
                     while (!proxy && load) {
                         for (const p of this._iterProxies()) {
                             const {identityBlacklist} = p;
                             if (p.identity) continue;
-                            if (identity && identityBlacklist && identityBlacklist.includes(identity)) continue;
-                            if (p.lastTimeUsed > Date.now() - this._options.minIntervalBetweenUse * 1000) continue;
-                            if (get(this._identities, [identity, 'proxyBlacklist'], []).includes(this._id(p))) continue;
-                            if (location) {
-                                if (p.location !== location) {
-                                    if (this._options.identityLocationConstrained) continue;
-                                    if (this._options.identityLocationPreferred && proxy && proxy.location === location) continue;
-                                } else if (proxy && proxy.location !== location) {
-                                    proxy = undefined;
+                            if (id && identityBlacklist && identityBlacklist.includes(id)) continue;
+                            if (p.lastTimeUsed > Date.now() - options.minIntervalBetweenUse * 1000) continue;
+                            if (id && get(this._identities, [id, 'proxyBlacklist'], []).includes(this._id(p))) continue;
+                            if (!isEmpty(locationPreference)) {
+                                const thisPreference = locationPreference[p.location];
+                                if (options.identityLocationConstrained && thisPreference !== 0) continue;
+                                if (options.identityLocationPreferred) {
+                                    const existingPreference = proxy && locationPreference[proxy.location];
+                                    if (
+                                        existingPreference == null && thisPreference != null || 
+                                        existingPreference > thisPreference
+                                    ) {
+                                        proxy = undefined;
+                                    } else if (
+                                        existingPreference != null && thisPreference == null ||
+                                        existingPreference < thisPreference
+                                    ) {
+                                        continue;
+                                    }
                                 }
                             }
                             if (!proxy) {
                                 proxy = p;
                             } else {
-                                if (this._options.recentlyUsedFirst) {
+                                if (options.recentlyUsedFirst) {
                                     if (p.lastTimeUsed > proxy.lastTimeUsed) {
                                         proxy = p;
                                     }
@@ -156,18 +188,18 @@ module.exports = {
                     }
                 }
                 if (proxy) {
-                    if (identity) {
-                        proxy.identity = identity;
+                    if (id) {
+                        proxy.identity = id;
                         proxy.identityAssignedAt = new Date();
-                        setWith(this._identities, [identity, 'proxy'], this._id(proxy), Object);
-                        setWith(this._identities, [identity, 'lastTimeAssignedProxy'], new Date(), Object);
-                        setWith(this._identities, [identity, 'location'], proxy.location || null, Object);
+                        setWith(this._identities, [id, 'proxy'], this._id(proxy), Object);
+                        setWith(this._identities, [id, 'lastTimeAssignedProxy'], new Date(), Object);
+                        setWith(this._identities, [id, 'location'], proxy.location || null, Object);
                     }
                     this.touch(logger, proxy);
                     const one = this._str(proxy);
                     this._info(
                         logger, one, ...(proxy.location ? [' (', proxy.location, ')'] : []),
-                        ' is being used', identity ? ` for identity ${identity}` : '', '.'
+                        ' is being used', ...(id ? [' for identity ', id] : []), '.'
                     );
                     return one;
                 }
@@ -325,9 +357,11 @@ module.exports = {
                 proxy.deprecated = (proxy.deprecated || 0) + 1;
                 this._info(
                     logger, this._str(proxy), ' is marked as deprecated (',
-                    proxy.deprecated, '/', this._options.maxDeprecationsBeforeRemoval, ').'
+                    proxy.deprecated, '/', 
+                    this._options.maxDeprecationsBeforeRemoval >= 0 ? this._options.maxDeprecationsBeforeRemoval : '∞', 
+                    ').'
                 );
-                if (proxy.deprecated >= this._options.maxDeprecationsBeforeRemoval) {
+                if (this._isDeprecated(proxy)) {
                     this.remove(logger, proxy);
                 } else {
                     if (clearIdentity) {
@@ -488,7 +522,7 @@ module.exports = {
 
             _isDeprecated(proxy) {
                 const {deprecated} = proxy;
-                return deprecated >= this._options.maxDeprecationsBeforeRemoval;
+                return this._options.maxDeprecationsBeforeRemoval >= 0 && deprecated >= this._options.maxDeprecationsBeforeRemoval;
             }
 
             _isIdentityExpired(proxy) {
