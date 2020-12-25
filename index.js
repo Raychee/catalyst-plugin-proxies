@@ -153,10 +153,10 @@ module.exports = {
                             if (p.lastTimeUsed > Date.now() - options.minIntervalBetweenUse * 1000) continue;
                             if (id && get(this._identities, [id, 'proxyBlacklist'], []).includes(this._id(p))) continue;
                             if (!isEmpty(locationPreference)) {
-                                const thisPreference = locationPreference[p.location];
+                                const thisPreference = p.location && locationPreference[p.location];
                                 if (options.identityLocationConstrained && thisPreference !== 0) continue;
                                 if (options.identityLocationPreferred) {
-                                    const existingPreference = proxy && locationPreference[proxy.location];
+                                    const existingPreference = proxy && proxy.location && locationPreference[proxy.location];
                                     if (
                                         existingPreference == null && thisPreference != null || 
                                         existingPreference > thisPreference
