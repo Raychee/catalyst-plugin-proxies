@@ -86,8 +86,7 @@ module.exports = {
                 }
                 this._request = await this._pluginLoader.get({type: 'request', ...this._options.request});
                 for (const proxy of this._iterProxies(proxies)) {
-                    const id = this._id(proxy);
-                    this._proxies[id] = {...proxy, ...this._proxies[id]};
+                    this._add(proxy);
                 }
                 for (const [id, identity] of Object.entries(identities)) {
                     this._identities[id] = {...identity, ...this._identities[id]};
@@ -172,15 +171,16 @@ module.exports = {
                             }
                             if (!proxy) {
                                 proxy = p;
-                            } else {
+                            } else if (p.deprecated > proxy.deprecated) {
+                            } else if (p.deprecated < proxy.deprecated) {
+                                proxy = p;
+                            } else if (p.lastTimeUsed > proxy.lastTimeUsed) {
                                 if (options.recentlyUsedFirst) {
-                                    if (p.lastTimeUsed > proxy.lastTimeUsed) {
-                                        proxy = p;
-                                    }
-                                } else {
-                                    if (p.lastTimeUsed < proxy.lastTimeUsed) {
-                                        proxy = p;
-                                    }
+                                    proxy = p;
+                                }
+                            } else if (p.lastTimeUsed < proxy.lastTimeUsed) {
+                                if (!options.recentlyUsedFirst) {
+                                    proxy = p;
                                 }
                             }
                         }
@@ -292,12 +292,7 @@ module.exports = {
                                 proxiesRequested = [proxiesRequested];
                             }
                             for (let proxy of proxiesRequested) {
-                                if (typeof proxy === 'string') {
-                                    const [ip, port] = proxy.split(':');
-                                    proxy = {ip, port};
-                                }
-                                const id = this._id(proxy);
-                                this._proxies[id] = {...this._proxies[id], ...proxy};
+                                this._add(proxy);
                                 added++;
                             }
                         }
@@ -351,7 +346,7 @@ module.exports = {
                 this._syncStore();
             }
 
-            deprecate(logger, one, {clearIdentity = true} = {}) {
+            deprecate(logger, one, {blacklistProxyFromIdentity = true} = {}) {
                 const proxy = this._find(one);
                 if (!proxy) return;
                 proxy.deprecated = (proxy.deprecated || 0) + 1;
@@ -363,21 +358,35 @@ module.exports = {
                 );
                 if (this._isDeprecated(proxy)) {
                     this.remove(logger, proxy);
-                } else {
-                    if (clearIdentity) {
-                        this._deprecateIdentity(proxy);
-                    }
+                } else if (blacklistProxyFromIdentity) {
+                    this._blacklistProxyFromIdentity(proxy);
                 }
                 this._syncStore();
             }
+            
+            clearIdentity(logger, identity) {
+                for (const proxy of this._iterProxies()) {
+                    if (proxy.identityBlacklist) {
+                        proxy.identityBlacklist = proxy.identityBlacklist.filter(i => i !== identity);
+                    }
+                    if (proxy.identity === identity) {
+                        this._clearProxyIdentity(proxy);
+                    }
+                }
+                if (this._identities[identity]) {
+                    this._identities[identity] = null;
+                }
+                this._info(logger, 'identity ', identity, ' is all cleared from proxies.');
+                this._syncStore();
+            }
 
-            remove(logger, one, {clearIdentity = true} = {}) {
+            remove(logger, one, {blacklistProxyFromIdentity = true} = {}) {
                 const proxy = this._find(one);
                 if (!proxy) return;
                 this._proxies[this._id(proxy)] = null;
                 this._info(logger, this._str(proxy), ' is removed: ', proxy);
-                if (clearIdentity) {
-                    this._deprecateIdentity(proxy, {proxyRemoved: true});
+                if (blacklistProxyFromIdentity) {
+                    this._blacklistProxyFromIdentity(proxy, {isProxyRemoved: true});
                 }
                 this._syncStore();
             }
@@ -395,6 +404,18 @@ module.exports = {
                     id = this._id(one);
                 }
                 return this._proxies[id];
+            }
+            
+            _add(proxy) {
+                if (typeof proxy === 'string') {
+                    const [ip, port] = proxy.split(':');
+                    proxy = {ip, port};
+                }
+                const id = this._id(proxy);
+                this._proxies[id] = {
+                    deprecated: 0, lastTimeUsed: new Date(0), 
+                    ...proxy, ...this._proxies[id]
+                };
             }
 
             * _iterProxies(proxies) {
@@ -417,7 +438,7 @@ module.exports = {
                     .forEach(([id]) => this.remove(logger, id));
                 for (const proxy of this._iterProxies()) {
                     if (this._isIdentityExpired(proxy)) {
-                        this._clearIdentity(proxy);
+                        this._clearProxyIdentity(proxy);
                     }
                 }
                 Object.entries(this._identities)
@@ -439,16 +460,16 @@ module.exports = {
                 }
             }
 
-            _deprecateIdentity(proxy, {proxyRemoved} = {}) {
+            _blacklistProxyFromIdentity(proxy, {isProxyRemoved} = {}) {
                 if (proxy.identity) {
                     if (!proxy.identityBlacklist) proxy.identityBlacklist = [];
                     proxy.identityBlacklist.push(proxy.identity);
                 }
-                this._clearIdentity(proxy);
+                this._clearProxyIdentity(proxy);
                 const p = this._id(proxy);
                 for (const identity of this._iterIdentities()) {
                     if (identity.proxy !== p) continue;
-                    if (proxyRemoved) {
+                    if (isProxyRemoved) {
                         if (identity.proxyBlacklist) {
                             identity.proxyBlacklist = identity.proxyBlacklist.filter(pb => pb !== p);
                         }
@@ -460,7 +481,7 @@ module.exports = {
                 }
             }
             
-            _clearIdentity(proxy) {
+            _clearProxyIdentity(proxy) {
                 proxy.identity = null;
                 proxy.identityAssignedAt = null;
             }
